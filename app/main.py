@@ -98,6 +98,8 @@ def admin_invite(request: InviteRequest, authorization: str | None = Header(defa
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.post("/api/secure/query")
@@ -117,6 +119,8 @@ def secure_query(request: SecureQueryRequest, authorization: str | None = Header
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.get("/api/meta", response_model=MetaResponse)
@@ -124,5 +128,5 @@ def meta() -> MetaResponse:
     return MetaResponse(
         app_name=settings.app_name,
         model=settings.openai_model,
-        copilot_mode="openai" if settings.openai_api_key else "heuristic",
+        copilot_mode="openai",
     )

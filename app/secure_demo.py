@@ -1,6 +1,7 @@
 """Tenant-scoped, prompt-safe demo service used by the enterprise lab."""
 from __future__ import annotations
 
+import json
 import re
 import time
 from collections import defaultdict, deque
@@ -35,6 +36,14 @@ class Actor:
     role: str
 
 
+class LLMRateLimitExceeded(Exception):
+    """Raised before a provider call when the authenticated LLM quota is exhausted."""
+
+    def __init__(self, retry_after: int) -> None:
+        self.retry_after = retry_after
+        super().__init__("LLM call rate limit exceeded")
+
+
 class LocalRateLimiter:
     """Safe development fallback. Production deployments use Redis at the edge."""
     def __init__(self) -> None:
@@ -63,13 +72,12 @@ def _redis() -> Redis | None:
     return _redis_client
 
 
-def check_rate_limit(key: str) -> tuple[bool, int]:
-    """Distributed counter in Redis, with an explicit local dev fallback."""
-    limit = get_settings().rate_limit_per_minute
+def _check_rate_limit(namespace: str, key: str, limit: int) -> tuple[bool, int]:
+    """Distributed fixed-window counter, with an explicit local dev fallback."""
     try:
         client = _redis()
         if client is not None:
-            redis_key = f"secure-bi:rate:{key}"
+            redis_key = f"secure-bi:{namespace}:rate:{key}"
             count = client.incr(redis_key)
             if count == 1:
                 client.expire(redis_key, 60)
@@ -78,7 +86,20 @@ def check_rate_limit(key: str) -> tuple[bool, int]:
     except Exception:
         # The fallback keeps local teaching mode usable; production should alert on Redis failure.
         pass
-    return limiter.allow(key, limit)
+    return limiter.allow(f"{namespace}:{key}", limit)
+
+
+def check_api_rate_limit(actor: Actor) -> tuple[bool, int]:
+    """Protect the HTTP endpoint without consuming the more valuable LLM quota."""
+    settings = get_settings()
+    return _check_rate_limit("api", f"{actor.tenant_id}:{actor.user_id}", settings.api_rate_limit_per_minute)
+
+
+def check_llm_rate_limit(actor: Actor) -> tuple[bool, int]:
+    """Limit provider calls per tenant, user, and model across all API workers."""
+    settings = get_settings()
+    key = f"{actor.tenant_id}:{actor.user_id}:{settings.openai_model}"
+    return _check_rate_limit("llm", key, settings.llm_rate_limit_per_minute)
 
 
 def engine():
@@ -167,7 +188,22 @@ def plan_with_openai(actor: Actor, prompt: str) -> ExecutiveDashboardPlan:
     allowed = sorted(permitted_intents(actor))
     if not allowed:
         raise PermissionError("Your role has no dashboard permissions.")
-    response = OpenAI(api_key=settings.openai_api_key).responses.parse(
+    llm_allowed, retry_after = check_llm_rate_limit(actor)
+    if not llm_allowed:
+        audit(
+            actor,
+            "llm_rate_limit_exceeded",
+            "blocked",
+            json.dumps({"model": settings.openai_model, "retry_after_seconds": retry_after}),
+        )
+        raise LLMRateLimitExceeded(retry_after)
+
+    # The quota check is immediately before the provider call so any route or DAG
+    # node that uses this planner is charged consistently.
+    response = OpenAI(
+        api_key=settings.openai_api_key,
+        max_retries=settings.openai_max_retries,
+    ).responses.parse(
         model=settings.openai_model,
         store=False,
         input=[
@@ -217,6 +253,11 @@ def widgets_for_intent(intent: DashboardIntent, actor: Actor) -> list[dict]:
 
 
 def dashboard(actor: Actor, prompt: str) -> dict:
+    from .enterprise_dag import run_enterprise_dag
+    return run_enterprise_dag(actor, prompt)
+
+
+def legacy_dashboard(actor: Actor, prompt: str) -> dict:
     plan = plan_with_openai(actor, prompt)
     widgets = [widget for intent in dict.fromkeys(plan.intents) for widget in widgets_for_intent(intent, actor)][:6]
     audit(actor, "openai_dashboard_plan", "allowed", '{"planner":"responses_api"}')

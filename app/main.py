@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
 from .schemas import MetaResponse
-from .secure_demo import assess_prompt, check_rate_limit, dashboard
+from .secure_demo import LLMRateLimitExceeded, assess_prompt, check_api_rate_limit, dashboard
 from .auth import actor_from_bearer, initialize_auth, invite_user, login, register_company, tenant_users
 
 
@@ -106,15 +106,17 @@ def admin_invite(request: InviteRequest, authorization: str | None = Header(defa
 def secure_query(request: SecureQueryRequest, authorization: str | None = Header(default=None)) -> dict:
     try:
         actor = actor_from_bearer(authorization)
-        allowed, retry_after = check_rate_limit(f"{actor.tenant_id}:{actor.user_id}")
+        allowed, retry_after = check_api_rate_limit(actor)
         if not allowed:
-            raise HTTPException(status_code=429, detail="Rate limit exceeded", headers={"Retry-After": str(retry_after)})
+            raise HTTPException(status_code=429, detail="API rate limit exceeded", headers={"Retry-After": str(retry_after)})
         safe, reason = assess_prompt(request.prompt)
         if not safe:
             from .secure_demo import audit
             audit(actor, "prompt_injection_detected", "blocked")
             raise HTTPException(status_code=422, detail=reason)
         return dashboard(actor, request.prompt)
+    except LLMRateLimitExceeded as exc:
+        raise HTTPException(status_code=429, detail="LLM call rate limit exceeded", headers={"Retry-After": str(exc.retry_after)}) from exc
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except PermissionError as exc:

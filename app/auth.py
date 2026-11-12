@@ -37,15 +37,27 @@ def _secret() -> bytes:
 def _token(email: str) -> str:
     payload = f"{email}|{int(time.time()) + TOKEN_TTL_SECONDS}".encode()
     signature = hmac.new(_secret(), payload, hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(payload + b"." + signature).decode().rstrip("=")
+    # Encode each part independently. A raw HMAC is arbitrary bytes and can
+    # contain '.', so using '.' as a delimiter before Base64 encoding makes a
+    # subset of otherwise valid tokens impossible to decode.
+    encoded_payload = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    encoded_signature = base64.urlsafe_b64encode(signature).decode().rstrip("=")
+    return f"{encoded_payload}.{encoded_signature}"
 
 
 def _decode_token(token: str) -> str:
-    raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
-    payload, signature = raw.rsplit(b".", 1)
+    try:
+        encoded_payload, encoded_signature = token.split(".", 1)
+        payload = base64.urlsafe_b64decode(encoded_payload + "=" * (-len(encoded_payload) % 4))
+        signature = base64.urlsafe_b64decode(encoded_signature + "=" * (-len(encoded_signature) % 4))
+    except (ValueError, UnicodeError) as exc:
+        raise ValueError("Invalid session token") from exc
     if not hmac.compare_digest(signature, hmac.new(_secret(), payload, hashlib.sha256).digest()):
         raise ValueError("Invalid session token")
-    email, expires_at = payload.decode().rsplit("|", 1)
+    try:
+        email, expires_at = payload.decode().rsplit("|", 1)
+    except (UnicodeError, ValueError) as exc:
+        raise ValueError("Invalid session token") from exc
     if int(expires_at) < time.time():
         raise ValueError("Session expired")
     return email

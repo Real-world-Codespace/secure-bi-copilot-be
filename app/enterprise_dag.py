@@ -27,9 +27,36 @@ CATALOG = {
 }
 CATALOG["tenant_admin"] = set().union(*CATALOG.values())
 
+TABLE_GUIDE = {
+    "orders": "orders(order_id, tenant_id, customer_id, warehouse_id, order_date, channel, status, subtotal, discount_amount, shipping_fee, total_amount)",
+    "order_items": "order_items(order_item_id, order_id, product_id, quantity, unit_price, unit_cost, line_discount, line_total)",
+    "products": "products(product_id, tenant_id, sku, product_name, category, unit_cost, list_price, active)",
+    "customers": "customers(customer_id, tenant_id, customer_name, segment, region, email, phone, created_at)",
+    "payments": "payments(payment_id, order_id, paid_at, method, status, amount)",
+    "shipments": "shipments(shipment_id, order_id, carrier, shipped_at, delivered_at, promised_date, status)",
+    "returns": "returns(return_id, order_id, returned_at, reason, refund_amount, status)",
+    "v_sales_daily": "v_sales_daily(tenant_id, day, channel, order_count, revenue)",
+    "inventory_snapshots": "inventory_snapshots(snapshot_id, tenant_id, warehouse_id, product_id, snapshot_date, on_hand_units, reserved_units, reorder_point)",
+    "warehouses": "warehouses(warehouse_id, tenant_id, warehouse_name, region, capacity_units)",
+    "support_tickets": "support_tickets(ticket_id, tenant_id, customer_id, order_id, created_at, channel, priority, category, status, resolution_hours)",
+    "v_inventory_risk": "v_inventory_risk(tenant_id, snapshot_date, region, category, sku, on_hand_units, reserved_units, reorder_point, at_risk)",
+    "employees": "employees(employee_id, tenant_id, employee_name, department, job_title, region, hired_at, employment_status)",
+    "payroll": "payroll(payroll_id, employee_id, pay_period, base_salary, bonus)",
+}
+
 
 class Relevance(BaseModel):
     relevance: Literal["relevant", "not_relevant"]
+
+
+class RelevanceAndSQL(BaseModel):
+    """The first LLM node combines two dependent planning decisions.
+
+    Keeping them together avoids a separate network round trip while the DAG
+    still exposes check_relevance -> generate_sql as distinct control nodes.
+    """
+    relevance: Literal["relevant", "not_relevant"]
+    sql_query: str | None = Field(default=None, max_length=6000)
 
 
 class SQLDraft(BaseModel):
@@ -51,12 +78,18 @@ class DAGState(TypedDict, total=False):
     attempts: int
     relevance: str
     sql_error: str
+    failure_message: str
     answer: Answer
 
 
 def _catalog_text(actor: Actor) -> str:
     tables = sorted(CATALOG.get(actor.role, set()))
-    return "\n".join(f"- {name}" for name in tables)
+    joins = (
+        "Join keys: orders.order_id=order_items.order_id; order_items.product_id=products.product_id; "
+        "orders.customer_id=customers.customer_id; orders.warehouse_id=warehouses.warehouse_id; "
+        "payroll.employee_id=employees.employee_id."
+    )
+    return "\n".join([*(f"- {TABLE_GUIDE[name]}" for name in tables), joins])
 
 
 @lru_cache(maxsize=8)
@@ -105,7 +138,11 @@ def _validate_sql(sql: str, actor: Actor) -> str:
     banned = (exp.Insert, exp.Update, exp.Delete, exp.Drop, exp.Create, exp.Command)
     if any(expression.find(kind) for kind in banned):
         raise ValueError("Only read-only SQL is allowed")
-    return expression.limit(get_settings().max_query_rows).sql(dialect="postgres")
+    # sqlglot serializes named placeholders as ``%(tenant_id)s`` for its
+    # PostgreSQL dialect. SQLAlchemy's ``text()`` expects ``:tenant_id`` and
+    # otherwise escapes the percent sign before handing it to psycopg.
+    normalized = expression.limit(get_settings().max_query_rows).sql(dialect="postgres")
+    return normalized.replace("%(tenant_id)s", ":tenant_id")
 
 
 def _execute(sql: str, actor: Actor) -> list[dict[str, Any]]:
@@ -130,14 +167,22 @@ def run_enterprise_dag(actor: Actor, question: str) -> dict:
     catalog = _catalog_text(actor)
 
     def relevance(state: DAGState) -> DAGState:
-        chain = _llm(actor).with_structured_output(Relevance)
-        result = chain.invoke(f"Classify only whether this is a business analytics question answerable from these permitted tables:\n{catalog}\nQuestion: {state['question']}")
-        return {"relevance": result.relevance}
+        chain = _llm(actor).with_structured_output(RelevanceAndSQL)
+        result = chain.invoke(
+            "Classify whether this is a business analytics question answerable from these permitted tables. "
+            "If relevant, also generate exactly one PostgreSQL SELECT. Use only permitted tables, include "
+            "exactly :tenant_id as the tenant filter, never access identities, audit logs or secrets, and return "
+            "no prose. If not relevant, set sql_query to null.\n"
+            f"Permitted tables:\n{catalog}\nQuestion: {state['question']}"
+        )
+        return {"relevance": result.relevance, "sql_query": result.sql_query or ""}
 
     def generate_sql(state: DAGState) -> DAGState:
-        chain = _llm(actor).with_structured_output(SQLDraft)
-        result = chain.invoke(f"Generate one PostgreSQL SELECT for the question. Use only permitted tables:\n{catalog}\nEvery query MUST include a tenant filter using exactly :tenant_id. Never access identities, audit logs or secrets. Return SQL only.\nQuestion: {state['question']}")
-        return {"sql_query": result.sql_query}
+        # SQL was drafted atomically with relevance above. This explicit DAG
+        # node remains a policy boundary before validation/execution.
+        if not state.get("sql_query"):
+            return {"sql_error": "No SQL draft was produced for a relevant question."}
+        return {"sql_query": state["sql_query"]}
 
     def execute_sql(state: DAGState) -> DAGState:
         try:
@@ -159,14 +204,20 @@ def run_enterprise_dag(actor: Actor, question: str) -> dict:
     def unrelated(state: DAGState) -> DAGState:
         return {"answer": Answer(title="Business data copilot", message="Câu hỏi không liên quan đến dữ liệu nghiệp vụ mà vai trò của bạn được phép truy cập.")}
 
+    def sql_failure(state: DAGState) -> DAGState:
+        return {"answer": Answer(
+            title="Không thể tạo truy vấn an toàn",
+            message="Câu hỏi thuộc phạm vi dữ liệu được phép, nhưng hệ thống không thể tạo một truy vấn SQL hợp lệ sau các lần kiểm tra. Hãy thử diễn đạt cụ thể hơn về chỉ số, thời gian hoặc nhóm dữ liệu cần phân tích.",
+        )}
+
     graph = StateGraph(DAGState)
     graph.add_node("check_relevance", relevance); graph.add_node("generate_sql", generate_sql); graph.add_node("execute_sql", execute_sql)
-    graph.add_node("repair_sql", repair); graph.add_node("generate_answer", answer); graph.add_node("unrelated", unrelated)
+    graph.add_node("repair_sql", repair); graph.add_node("generate_answer", answer); graph.add_node("unrelated", unrelated); graph.add_node("sql_failure", sql_failure)
     graph.set_entry_point("check_relevance")
     graph.add_conditional_edges("check_relevance", lambda s: "generate_sql" if s["relevance"] == "relevant" else "unrelated")
     graph.add_edge("generate_sql", "execute_sql")
-    graph.add_conditional_edges("execute_sql", lambda s: "generate_answer" if not s.get("sql_error") else ("repair_sql" if s.get("attempts", 0) < MAX_SQL_REPAIR_ATTEMPTS else "unrelated"))
-    graph.add_edge("repair_sql", "execute_sql"); graph.add_edge("generate_answer", END); graph.add_edge("unrelated", END)
+    graph.add_conditional_edges("execute_sql", lambda s: "generate_answer" if not s.get("sql_error") else ("repair_sql" if s.get("attempts", 0) < MAX_SQL_REPAIR_ATTEMPTS else "sql_failure"))
+    graph.add_edge("repair_sql", "execute_sql"); graph.add_edge("generate_answer", END); graph.add_edge("unrelated", END); graph.add_edge("sql_failure", END)
     result = graph.compile().invoke({"question": question, "attempts": 0})
     answer_result = result["answer"]
     return {"title": answer_result.title, "message": answer_result.message, "mode": "openai", "widgets": [_widget(result.get("query_rows", []), result.get("sql_query", ""))] if result.get("query_rows") is not None else [], "security": {"tenant": actor.email.split("@")[0], "role": actor.role, "prompt_decision": "allowed"}}

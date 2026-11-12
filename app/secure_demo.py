@@ -12,6 +12,7 @@ from uuid import uuid4
 from openai import OpenAI
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 from redis import Redis
 
 from .config import get_settings
@@ -104,6 +105,31 @@ def check_llm_rate_limit(actor: Actor) -> tuple[bool, int]:
 
 def engine():
     return create_engine(get_settings().database_url, pool_pre_ping=True)
+
+
+def managed_data_source(actor: Actor) -> dict:
+    """Return connection metadata without exposing a URL, username, or secret."""
+    if actor.role not in SENSITIVE_ROLES:
+        raise PermissionError("Only tenant administrators and security administrators can view data-source configuration")
+
+    settings = get_settings()
+    url = make_url(settings.database_url)
+    try:
+        with engine().connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except Exception as exc:
+        raise RuntimeError("The managed operating database is unavailable") from exc
+
+    return {
+        "name": "Managed enterprise operating database",
+        "status": "connected",
+        "engine": url.get_backend_name(),
+        "database": url.database or "managed",
+        "host": url.host or "managed network",
+        "tenant_binding": "server-bound :tenant_id",
+        "credential_policy": "Credentials are held only in backend configuration",
+        "enabled_domains": ["sales", "operations", "hr"],
+    }
 
 
 def actor_from_email(email: str) -> Actor:

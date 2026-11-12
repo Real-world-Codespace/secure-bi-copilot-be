@@ -4,6 +4,7 @@ import pytest
 
 import app.enterprise_dag as enterprise_dag
 import app.secure_demo as secure_demo
+import app.auth as auth
 from app.secure_demo import Actor, LLMRateLimitExceeded, LocalRateLimiter, assess_prompt
 
 
@@ -100,3 +101,21 @@ def test_dag_llm_uses_shared_worker_limiter_after_redis_gate(monkeypatch: pytest
     assert first["rate_limiter"] is second["rate_limiter"]
     assert captured["max_retries"] == 0
     assert captured["rate_limiter"].requests_per_second == 2.0
+
+
+def test_session_token_round_trips_with_unambiguous_parts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(auth, "_secret", lambda: b"test-auth-secret")
+    token = auth._token("tenant_admin.northstar@example.test")
+
+    assert token.count(".") == 1
+    assert auth._decode_token(token) == "tenant_admin.northstar@example.test"
+
+
+def test_sql_validation_preserves_server_bound_sqlalchemy_parameter() -> None:
+    actor = Actor("user-a", "tenant-a", "user-a@example.test", "sales_manager")
+    sql = "SELECT COUNT(*) AS value FROM orders WHERE tenant_id=:tenant_id"
+
+    validated = enterprise_dag._validate_sql(sql, actor)
+
+    assert ":tenant_id" in validated
+    assert "%(tenant_id)s" not in validated

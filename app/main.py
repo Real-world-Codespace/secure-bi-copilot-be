@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
 from .schemas import MetaResponse
-from .secure_demo import LLMRateLimitExceeded, assess_prompt, check_api_rate_limit, dashboard
+from .secure_demo import LLMRateLimitExceeded, assess_prompt, check_api_rate_limit, dashboard, managed_data_source
 from .auth import actor_from_bearer, initialize_auth, invite_user, login, register_company, tenant_users
 
 
@@ -96,6 +96,18 @@ def admin_invite(request: InviteRequest, authorization: str | None = Header(defa
         return {"status": "invited"}
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/api/admin/data-source")
+def admin_data_source(authorization: str | None = Header(default=None)) -> dict:
+    try:
+        return managed_data_source(actor_from_bearer(authorization))
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except RuntimeError as exc:
